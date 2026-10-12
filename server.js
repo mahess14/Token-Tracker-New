@@ -123,6 +123,9 @@ async function stockByProduct(userId) {
   });
 }
 
+const stockOf = async (userId, product) =>
+  (await stockByProduct(userId)).find((s) => s.product === product);
+
 function readEntry(body, priceField) {
   const quantity = Number(body.quantity);
   const price = Number(body[priceField]);
@@ -146,7 +149,7 @@ app.post("/api/sales", auth, wrap(async (req, res) => {
   const e = readEntry(body, "sellingPrice");
   if (e.error) return res.status(400).json({ error: e.error });
 
-  const stock = (await stockByProduct(req.user._id)).find((s) => s.product === body.product);
+  const stock = await stockOf(req.user._id, body.product);
   if (e.quantity > stock.inStock)
     return res.status(400).json({ error: `Only ${stock.inStock} × ${body.product} in stock` });
 
@@ -160,6 +163,33 @@ app.post("/api/sales", auth, wrap(async (req, res) => {
     amount: e.amount,
   });
   res.status(201).json(sale);
+}));
+
+// EDIT a sale
+app.put("/api/sales/:id", auth, wrap(async (req, res) => {
+  if (badId(req.params.id)) return res.status(404).json({ error: "Sale not found" });
+  const body = req.body || {};
+  const e = readEntry(body, "sellingPrice");
+  if (e.error) return res.status(400).json({ error: e.error });
+
+  const sale = await Sale.findOne({ _id: req.params.id, user: req.user._id });
+  if (!sale) return res.status(404).json({ error: "Sale not found" });
+
+  // This sale's own quantity is already counted as sold, so add it back
+  // when the product stays the same.
+  const stock = await stockOf(req.user._id, body.product);
+  const available = stock.inStock + (sale.product === body.product ? sale.quantity : 0);
+  if (e.quantity > available)
+    return res.status(400).json({ error: `Only ${available} × ${body.product} in stock` });
+
+  sale.date = body.date;
+  sale.quantity = e.quantity;
+  sale.product = body.product;
+  sale.sellingPrice = e.price;
+  sale.customerName = (body.customerName || "").trim();
+  sale.amount = e.amount;
+  await sale.save();
+  res.json(sale);
 }));
 
 app.delete("/api/sales/:id", auth, wrap(async (req, res) => {
@@ -190,12 +220,46 @@ app.post("/api/purchases", auth, wrap(async (req, res) => {
   res.status(201).json(purchase);
 }));
 
+// EDIT a stock purchase
+app.put("/api/purchases/:id", auth, wrap(async (req, res) => {
+  if (badId(req.params.id)) return res.status(404).json({ error: "Purchase not found" });
+  const body = req.body || {};
+  const e = readEntry(body, "costPrice");
+  if (e.error) return res.status(400).json({ error: e.error });
+
+  const p = await Purchase.findOne({ _id: req.params.id, user: req.user._id });
+  if (!p) return res.status(404).json({ error: "Purchase not found" });
+
+  // Stock of the ORIGINAL product must not go below zero after the change
+  // (i.e. you can't reduce/move tokens that are already sold).
+  const oldStock = await stockOf(req.user._id, p.product);
+  const removed = p.product === body.product ? p.quantity - e.quantity : p.quantity;
+  if (oldStock.inStock - removed < 0) {
+    const minQty = p.quantity - oldStock.inStock;
+    return res.status(400).json({
+      error:
+        p.product === body.product
+          ? `Can't reduce below ${minQty}: those tokens are already sold`
+          : `Can't change product: some ${p.product} from this purchase are already sold`,
+    });
+  }
+
+  p.date = body.date;
+  p.quantity = e.quantity;
+  p.product = body.product;
+  p.costPrice = e.price;
+  p.supplierName = (body.supplierName || "").trim();
+  p.amount = e.amount;
+  await p.save();
+  res.json(p);
+}));
+
 app.delete("/api/purchases/:id", auth, wrap(async (req, res) => {
   if (badId(req.params.id)) return res.status(404).json({ error: "Purchase not found" });
   const p = await Purchase.findOne({ _id: req.params.id, user: req.user._id });
   if (!p) return res.json({ ok: true });
 
-  const stock = (await stockByProduct(req.user._id)).find((s) => s.product === p.product);
+  const stock = await stockOf(req.user._id, p.product);
   if (stock.inStock - p.quantity < 0)
     return res.status(400).json({ error: "Can't delete: some of these tokens are already sold" });
 
